@@ -3,15 +3,19 @@
 # ==============================================================================
 #
 # Cloudflare DNS Worker - Unified Smart Installer & Updater
-# Version: 1.5.0
+# Version: 2.0.0
 #
 # This script intelligently self-updates and then installs the DNS worker.
+# It is fully self-contained with no external dependencies like 'jq'.
+# It features a semi-automated, browser-based token acquisition flow for Termux.
+#
 # Author: Your Name/Alias & AI Thought Partner
 #
-# v1.5.0 Changes:
-#   - Fixed 'sudo: command not found' error in non-sudo environments like Termux.
-#   - Added environment-aware logic to use 'sudo' only when necessary and available.
-#   - Prioritized Termux's 'pkg' package manager.
+# v2.0.0 Major Changes:
+#   - Removed 'jq' dependency entirely. JSON parsing is now handled by internal
+#     shell functions using grep, sed, and awk for maximum portability.
+#   - Implemented a semi-automated token flow that opens the Cloudflare token
+#     creation page directly in the user's browser (optimized for Termux).
 #
 # ==============================================================================
 
@@ -19,7 +23,7 @@
 set -euo pipefail
 
 # --- Script Configuration ---
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly REPO_USER="sinaha81"
 readonly REPO_NAME="dns-wizard"
 readonly BRANCH_NAME="main"
@@ -33,7 +37,7 @@ readonly LOCAL_INSTALL_DIR="${HOME}/.dns-worker-installer"
 readonly LOCAL_SCRIPT_PATH="${LOCAL_INSTALL_DIR}/${SCRIPT_FILENAME}"
 readonly CF_API_BASE_URL="https://api.cloudflare.com/client/v4"
 readonly WORKER_SOURCE_URL="https://raw.githubusercontent.com/sinaha81/dns/main/worker.js"
-readonly CURL_TIMEOUT=15
+readonly CURL_TIMEOUT=20
 
 # --- Color Codes ---
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_BLUE='\033[0;34m'; C_YELLOW='\033[1;33m';
@@ -55,7 +59,8 @@ handle_self_update() {
         return
     }
 
-    if [[ "$SCRIPT_VERSION" != "$latest_version" ]]; then
+    if [[ "$SCRIPT_VERSION" != "$latest_version" ]];
+    then
         info "A new version (${C_GREEN}${latest_version}${C_RESET}) is available. Updating from version ${C_YELLOW}${SCRIPT_VERSION}${C_RESET}..."
         mkdir -p "$LOCAL_INSTALL_DIR"
         chmod 700 "$LOCAL_INSTALL_DIR"
@@ -72,70 +77,99 @@ handle_self_update() {
 }
 
 # ==============================================================================
-# SECTION 2: CORE INSTALLER LOGIC FUNCTIONS
+# SECTION 2: SHELL-BASED JSON PARSING UTILITIES (jq REPLACEMENT)
 # ==============================================================================
 
-# Checks for dependencies and offers to install 'jq' if missing.
+# Parses a simple key-value from a JSON string.
+# Usage: parse_json_value <json_string> <key>
+parse_json_value() {
+    local json=$1
+    local key=$2
+    # This regex looks for the key, then captures the value inside the quotes.
+    # It handles potential whitespace and colons.
+    echo "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\(.[^\"]*\)\".*/\1/p"
+}
+
+# Checks if the "success" field in a JSON response is true.
+# Usage: is_success <json_string>
+is_success() {
+    local json=$1
+    # Grep for "success":true, ignoring whitespace.
+    echo "$json" | grep -q '"success"[[:space:]]*:[[:space:]]*true'
+}
+
+# Parses an array of objects and returns a formatted list of two specified keys.
+# Usage: parse_json_array <json_string> <key1> <key2>
+parse_json_array() {
+    local json=$1
+    local key1=$2
+    local key2=$3
+    # Use awk to process the JSON line by line.
+    # This is a robust way to handle multi-line formatted JSON.
+    echo "$json" | tr -d '\n' | tr '{' '\n' | \
+    sed 's/\[//g; s/\]//g' | \
+    grep "\"${key1}\"" | \
+    awk -F'"' -v k1="$key1" -v k2="$key2" '{
+        id=""; name="";
+        for(i=1; i<=NF; i++) {
+            if ($(i) == k1) id = $(i+2);
+            if ($(i) == k2) name = $(i+2);
+        }
+        if (id != "" && name != "") print id, name;
+    }'
+}
+
+# ==============================================================================
+# SECTION 3: CORE INSTALLER LOGIC FUNCTIONS
+# ==============================================================================
+
+# Checks for dependencies.
 ensure_dependencies() {
     info "Checking for required dependencies..."
     command -v curl >/dev/null || error "'curl' is not installed. Please install it first."
-
-    if command -v jq >/dev/null; then
-        success "'curl' and 'jq' are installed."
-        return
-    fi
-
-    warn "'jq' is not installed, but it is required to continue."
-    read -p "Would you like to attempt an automatic installation? (y/N): " choice
-    if [[ ! "$choice" =~ ^[yY]([eE][sS])?$ ]]; then
-        error "Please install 'jq' manually and run this script again."
-    fi
-
-    info "Attempting to install 'jq'..."
-    local SUDO_CMD=""
-    # Check if we are NOT root AND the sudo command exists.
-    if [[ $(id -u) -ne 0 ]] && command -v sudo >/dev/null; then
-        SUDO_CMD="sudo"
-    fi
-
-    # Termux (Android) has a specific environment and package manager 'pkg'
-    if [[ -n "${PREFIX-}" ]] && [[ "$PREFIX" == *"/com.termux"* ]]; then
-        pkg update -y && pkg install -y jq
-    elif command -v apt-get >/dev/null; then
-        $SUDO_CMD apt-get update && $SUDO_CMD apt-get install -y jq
-    elif command -v yum >/dev/null; then
-        $SUDO_CMD yum install -y jq
-    elif command -v dnf >/dev/null; then
-        $SUDO_CMD dnf install -y jq
-    elif command -v pacman >/dev/null; then
-        $SUDO_CMD pacman -S --noconfirm jq
-    elif command -v apk >/dev/null; then
-        $SUDO_CMD apk add jq
-    elif command -v brew >/dev/null; then
-        brew install jq
-    else
-        error "Could not detect a supported package manager. Please install 'jq' manually."
-    fi
-
-    command -v jq >/dev/null || error "Automatic installation of 'jq' failed. Please install it manually."
-    success "'jq' has been successfully installed."
+    # No jq check needed anymore!
+    success "All dependencies are met."
 }
 
-# Prompts for and validates the Cloudflare API token.
+# Guides the user through token creation using their browser.
 prompt_and_verify_token() {
     local api_token=""
-    info "A Cloudflare API token with 'Workers Scripts:Edit' permission is required."
-    info "Create one here: ${C_YELLOW}https://dash.cloudflare.com/profile/api-tokens${C_RESET}"
-    read -sp "Please enter your Cloudflare API token: " api_token
+    # This URL pre-fills the token creation form with the exact permissions needed.
+    local token_url="https://dash.cloudflare.com/profile/api-tokens/new?name=DNS-Worker-Wizard&description=API%20Token%20for%20DNS%20Worker%20Deployment&scope=com.cloudflare.api.account.zone.list&scope=com.cloudflare.api.account.user.read&scope=com.cloudflare.api.account.account.read&scope=com.cloudflare.api.account.workers.subdomain.update&scope=com.cloudflare.api.account.workers.script.update"
+
+    info "The script will now open a browser for you to create a secure API token."
+    warn "If the browser does not open, please manually copy the URL below."
+    echo -e "${C_YELLOW}${token_url}${C_RESET}"
+    echo
+    read -p "Press [ENTER] to continue..."
+
+    # Use termux-open-url if available, otherwise suggest manual opening.
+    if command -v termux-open-url >/dev/null; then
+        termux-open-url "$token_url"
+    else
+        warn "Could not find 'termux-open-url'. Please open the link manually."
+    fi
+
+    echo
+    info "IN YOUR BROWSER:"
+    echo "1. Scroll to the bottom of the Cloudflare page."
+    echo "2. Click the 'Continue to summary' button."
+    echo "3. Click the 'Create Token' button."
+    echo "4. Click the 'Copy' button to copy your new API token."
+    echo
+    
+    read -sp "Please paste the copied API token here: " api_token
     echo
     [[ -z "$api_token" ]] && error "API token cannot be empty."
     
     info "Verifying API token..."
     local verify_response
     verify_response=$(curl --connect-timeout ${CURL_TIMEOUT} -s -X GET "${CF_API_BASE_URL}/user/tokens/verify" -H "Authorization: Bearer ${api_token}")
-    if ! echo "$verify_response" | jq -e '.success' &>/dev/null; then
+    
+    if ! is_success "$verify_response"; then
         local error_msg
-        error_msg=$(echo "$verify_response" | jq -r '.errors[0].message' 2>/dev/null || echo "Invalid API response")
+        error_msg=$(parse_json_value "$verify_response" "message")
+        [[ -z "$error_msg" ]] && error_msg="Invalid API response"
         error "API token is invalid. Cloudflare message: ${error_msg}"
     fi
     success "API token verified successfully."
@@ -145,25 +179,33 @@ prompt_and_verify_token() {
 # Selects a Cloudflare account.
 select_cf_account() {
     info "Fetching your Cloudflare accounts..."
-    local accounts_response account_count
+    local accounts_response
     accounts_response=$(curl --connect-timeout ${CURL_TIMEOUT} -s -X GET "${CF_API_BASE_URL}/accounts" -H "Authorization: Bearer ${API_TOKEN}")
-    account_count=$(echo "$accounts_response" | jq '.result | length')
+    
+    local accounts_list
+    accounts_list=$(parse_json_array "$accounts_response" "id" "name")
+    [[ -z "$accounts_list" ]] && error "No accounts found for this API token."
 
-    [[ "$account_count" -eq 0 ]] && error "No accounts found for this API token."
+    local account_count
+    account_count=$(echo "$accounts_list" | wc -l)
     
     local account_id account_name
     if [[ "$account_count" -eq 1 ]]; then
-        account_id=$(echo "$accounts_response" | jq -r '.result[0].id')
-        account_name=$(echo "$accounts_response" | jq -r '.result[0].name')
+        account_id=$(echo "$accounts_list" | awk '{print $1}')
+        account_name=$(echo "$accounts_list" | awk '{$1=""; print $0}' | sed 's/^[ \t]*//')
         info "Account '${account_name}' selected automatically."
     else
         info "Multiple accounts found. Please choose one:"
-        echo "$accounts_response" | jq -r '.result[] | "\(.id) \(.name)"' | nl -w2 -s'. '
+        echo "$accounts_list" | nl -w2 -s'. '
         local choice
         read -p "Enter the number of the account you want to use: " choice
-        account_id=$(echo "$accounts_response" | jq -r ".result[$((choice-1))].id")
-        account_name=$(echo "$accounts_response" | jq -r ".result[$((choice-1))].name")
-        [[ "$account_id" == "null" || -z "$account_id" ]] && error "Invalid selection."
+        
+        local selection
+        selection=$(echo "$accounts_list" | sed -n "${choice}p")
+        [[ -z "$selection" ]] && error "Invalid selection."
+
+        account_id=$(echo "$selection" | awk '{print $1}')
+        account_name=$(echo "$selection" | awk '{$1=""; print $0}' | sed 's/^[ \t]*//')
         success "Account '${account_name}' selected."
     fi
     ACCOUNT_ID="${account_id}"
@@ -174,9 +216,9 @@ ensure_worker_subdomain() {
     info "Checking for a workers.dev subdomain..."
     local subdomain_response worker_subdomain
     subdomain_response=$(curl --connect-timeout ${CURL_TIMEOUT} -s -X GET "${CF_API_BASE_URL}/accounts/${ACCOUNT_ID}/workers/subdomain" -H "Authorization: Bearer ${API_TOKEN}")
-    worker_subdomain=$(echo "$subdomain_response" | jq -r '.result.subdomain')
+    worker_subdomain=$(parse_json_value "$subdomain_response" "subdomain")
 
-    if [[ "$worker_subdomain" != "null" && -n "$worker_subdomain" ]]; then
+    if [[ -n "$worker_subdomain" && "$worker_subdomain" != "null" ]]; then
         success "Your subdomain is '${worker_subdomain}'."
     else
         warn "You have not set up a workers.dev subdomain yet."
@@ -187,11 +229,11 @@ ensure_worker_subdomain() {
         info "Creating subdomain '${new_subdomain}.workers.dev'..."
         local create_response
         create_response=$(curl --connect-timeout ${CURL_TIMEOUT} -s -X PUT "${CF_API_BASE_URL}/accounts/${ACCOUNT_ID}/workers/subdomain" -H "Authorization: Bearer ${API_TOKEN}" -H "Content-Type: application/json" --data "{\"subdomain\": \"$new_subdomain\"}")
-        if echo "$create_response" | jq -e '.success' &>/dev/null; then
-            worker_subdomain=$(echo "$create_response" | jq -r '.result.subdomain')
+        if is_success "$create_response"; then
+            worker_subdomain=$(parse_json_value "$create_response" "subdomain")
             success "Subdomain '${worker_subdomain}' created successfully."
         else
-            error "Failed to create subdomain: $(echo "$create_response" | jq -r '.errors[0].message')"
+            error "Failed to create subdomain: $(parse_json_value "$create_response" "message")"
         fi
     fi
     WORKER_SUBDOMAIN="${worker_subdomain}"
@@ -215,17 +257,18 @@ deploy_worker() {
     http_code=$(echo "$deploy_response" | tail -n1)
     response_body=$(echo "$deploy_response" | sed '$d')
 
-    if [[ "$http_code" -eq 200 ]] && echo "$response_body" | jq -e '.success' &>/dev/null; then
+    if [[ "$http_code" -eq 200 ]] && is_success "$response_body"; then
         success "Worker '${worker_name}' deployed successfully."
     else
         local error_msg
-        error_msg=$(echo "$response_body" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown API error")
+        error_msg=$(parse_json_value "$response_body" "message")
+        [[ -z "$error_msg" ]] && error_msg="Unknown API error"
         error "Worker deployment failed (HTTP code: ${http_code}). Message: ${error_msg}"
     fi
 }
 
 # ==============================================================================
-# SECTION 3: MAIN INSTALLER WORKFLOW
+# SECTION 4: MAIN INSTALLER WORKFLOW
 # ==============================================================================
 run_installer_workflow() {
     clear
@@ -251,7 +294,6 @@ run_installer_workflow() {
     ensure_worker_subdomain
     echo
 
-    # --- Final Confirmation Step ---
     warn "You are about to deploy a worker with the following details:"
     echo -e "  Worker Name:  ${C_GREEN}${worker_name}${C_RESET}"
     echo -e "  Final URL:    ${C_GREEN}https://${worker_name}.${WORKER_SUBDOMAIN}${C_RESET}"
@@ -266,7 +308,6 @@ run_installer_workflow() {
     
     unset API_TOKEN
 
-    # --- Final Success Message ---
     local worker_url="https://${worker_name}.${WORKER_SUBDOMAIN}"
     echo
     success "======================================================="
@@ -281,7 +322,7 @@ run_installer_workflow() {
 }
 
 # ==============================================================================
-# SECTION 4: SCRIPT ENTRY POINT
+# SECTION 5: SCRIPT ENTRY POINT
 # ==============================================================================
 main() {
     trap 'echo -e "\n\n${C_RED}Operation aborted by user.${C_RESET}"; exit 130' INT
