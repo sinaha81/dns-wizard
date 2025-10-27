@@ -1,1 +1,2 @@
-bash <(curl -fsSL https://raw.githubusercontent.com/sinaha81/dns-installer/main/install.sh)
+
+bash <(curl -fsSL https://raw.githubusercontent.com/sinaha81/dns-wizard/main/install.sh)
