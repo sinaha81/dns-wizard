@@ -3,25 +3,23 @@
 # ==============================================================================
 #
 # Cloudflare DNS Worker - Unified Smart Installer & Updater
-# Version: 1.4.0
+# Version: 1.5.0
 #
 # This script intelligently self-updates and then installs the DNS worker.
 # Author: Your Name/Alias & AI Thought Partner
 #
-# v1.4.0 Changes:
-#   - Added smart dependency handler to auto-install 'jq' if missing.
-#   - Full translation of all prompts, messages, and comments to English.
+# v1.5.0 Changes:
+#   - Fixed 'sudo: command not found' error in non-sudo environments like Termux.
+#   - Added environment-aware logic to use 'sudo' only when necessary and available.
+#   - Prioritized Termux's 'pkg' package manager.
 #
 # ==============================================================================
 
 # --- Bash Strict Mode ---
-# -e: exit immediately if a command exits with a non-zero status.
-# -u: treat unset variables as an error when substituting.
-# -o pipefail: the return value of a pipeline is the status of the last command to exit with a non-zero status.
 set -euo pipefail
 
 # --- Script Configuration ---
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 readonly REPO_USER="sinaha81"
 readonly REPO_NAME="dns-wizard"
 readonly BRANCH_NAME="main"
@@ -35,7 +33,7 @@ readonly LOCAL_INSTALL_DIR="${HOME}/.dns-worker-installer"
 readonly LOCAL_SCRIPT_PATH="${LOCAL_INSTALL_DIR}/${SCRIPT_FILENAME}"
 readonly CF_API_BASE_URL="https://api.cloudflare.com/client/v4"
 readonly WORKER_SOURCE_URL="https://raw.githubusercontent.com/sinaha81/dns/main/worker.js"
-readonly CURL_TIMEOUT=15 # 15-second timeout for network requests
+readonly CURL_TIMEOUT=15
 
 # --- Color Codes ---
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_BLUE='\033[0;34m'; C_YELLOW='\033[1;33m';
@@ -59,10 +57,8 @@ handle_self_update() {
 
     if [[ "$SCRIPT_VERSION" != "$latest_version" ]]; then
         info "A new version (${C_GREEN}${latest_version}${C_RESET}) is available. Updating from version ${C_YELLOW}${SCRIPT_VERSION}${C_RESET}..."
-        
         mkdir -p "$LOCAL_INSTALL_DIR"
         chmod 700 "$LOCAL_INSTALL_DIR"
-        
         if curl --connect-timeout ${CURL_TIMEOUT} -fsSL -o "$LOCAL_SCRIPT_PATH" "$SELF_SCRIPT_URL"; then
             chmod +x "$LOCAL_SCRIPT_PATH"
             success "Installer updated successfully. Relaunching the new version..."
@@ -96,20 +92,29 @@ ensure_dependencies() {
     fi
 
     info "Attempting to install 'jq'..."
-    if command -v apt-get >/dev/null; then
-        sudo apt-get update && sudo apt-get install -y jq
+    local SUDO_CMD=""
+    # Check if we are NOT root AND the sudo command exists.
+    if [[ $(id -u) -ne 0 ]] && command -v sudo >/dev/null; then
+        SUDO_CMD="sudo"
+    fi
+
+    # Termux (Android) has a specific environment and package manager 'pkg'
+    if [[ -n "${PREFIX-}" ]] && [[ "$PREFIX" == *"/com.termux"* ]]; then
+        pkg update -y && pkg install -y jq
+    elif command -v apt-get >/dev/null; then
+        $SUDO_CMD apt-get update && $SUDO_CMD apt-get install -y jq
     elif command -v yum >/dev/null; then
-        sudo yum install -y jq
+        $SUDO_CMD yum install -y jq
     elif command -v dnf >/dev/null; then
-        sudo dnf install -y jq
+        $SUDO_CMD dnf install -y jq
     elif command -v pacman >/dev/null; then
-        sudo pacman -S --noconfirm jq
+        $SUDO_CMD pacman -S --noconfirm jq
     elif command -v apk >/dev/null; then
-        sudo apk add jq
+        $SUDO_CMD apk add jq
     elif command -v brew >/dev/null; then
         brew install jq
     else
-        error "Could not detect a supported package manager (apt, yum, dnf, pacman, apk, brew). Please install 'jq' manually."
+        error "Could not detect a supported package manager. Please install 'jq' manually."
     fi
 
     command -v jq >/dev/null || error "Automatic installation of 'jq' failed. Please install it manually."
@@ -122,7 +127,7 @@ prompt_and_verify_token() {
     info "A Cloudflare API token with 'Workers Scripts:Edit' permission is required."
     info "Create one here: ${C_YELLOW}https://dash.cloudflare.com/profile/api-tokens${C_RESET}"
     read -sp "Please enter your Cloudflare API token: " api_token
-    echo # Newline after silent input
+    echo
     [[ -z "$api_token" ]] && error "API token cannot be empty."
     
     info "Verifying API token..."
@@ -259,7 +264,6 @@ run_installer_workflow() {
 
     deploy_worker "${worker_name}"
     
-    # Unset the sensitive variable
     unset API_TOKEN
 
     # --- Final Success Message ---
@@ -280,7 +284,6 @@ run_installer_workflow() {
 # SECTION 4: SCRIPT ENTRY POINT
 # ==============================================================================
 main() {
-    # Handle Ctrl+C gracefully
     trap 'echo -e "\n\n${C_RED}Operation aborted by user.${C_RESET}"; exit 130' INT
 
     if [[ "${1-}" == "--version" ]]; then
@@ -288,7 +291,6 @@ main() {
         exit 0
     fi
     
-    # Global variables to be populated by functions
     API_TOKEN=""
     ACCOUNT_ID=""
     WORKER_SUBDOMAIN=""
