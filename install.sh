@@ -3,19 +3,19 @@
 # ==============================================================================
 #
 # Cloudflare DNS Worker - Unified Smart Installer & Updater
-# Version: 2.0.0
+# Version: 2.1.0
 #
 # This script intelligently self-updates and then installs the DNS worker.
-# It is fully self-contained with no external dependencies like 'jq'.
-# It features a semi-automated, browser-based token acquisition flow for Termux.
+# It is fully self-contained and uses the Termux:API for a seamless,
+# clipboard-based token acquisition flow, eliminating manual pasting.
 #
 # Author: Your Name/Alias & AI Thought Partner
 #
-# v2.0.0 Major Changes:
-#   - Removed 'jq' dependency entirely. JSON parsing is now handled by internal
-#     shell functions using grep, sed, and awk for maximum portability.
-#   - Implemented a semi-automated token flow that opens the Cloudflare token
-#     creation page directly in the user's browser (optimized for Termux).
+# v2.1.0 Feature Update:
+#   - Implemented a magical token acquisition flow using Termux:API's
+#     clipboard-get feature. The script now polls the clipboard,
+#     automating the token retrieval process after the user copies it.
+#   - Added a dependency check and installation guide for 'termux-api'.
 #
 # ==============================================================================
 
@@ -23,7 +23,7 @@
 set -euo pipefail
 
 # --- Script Configuration ---
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly REPO_USER="sinaha81"
 readonly REPO_NAME="dns-wizard"
 readonly BRANCH_NAME="main"
@@ -59,8 +59,7 @@ handle_self_update() {
         return
     }
 
-    if [[ "$SCRIPT_VERSION" != "$latest_version" ]];
-    then
+    if [[ "$SCRIPT_VERSION" != "$latest_version" ]]; then
         info "A new version (${C_GREEN}${latest_version}${C_RESET}) is available. Updating from version ${C_YELLOW}${SCRIPT_VERSION}${C_RESET}..."
         mkdir -p "$LOCAL_INSTALL_DIR"
         chmod 700 "$LOCAL_INSTALL_DIR"
@@ -77,38 +76,18 @@ handle_self_update() {
 }
 
 # ==============================================================================
-# SECTION 2: SHELL-BASED JSON PARSING UTILITIES (jq REPLACEMENT)
+# SECTION 2: SHELL-BASED JSON PARSING UTILITIES
 # ==============================================================================
-
-# Parses a simple key-value from a JSON string.
-# Usage: parse_json_value <json_string> <key>
 parse_json_value() {
-    local json=$1
-    local key=$2
-    # This regex looks for the key, then captures the value inside the quotes.
-    # It handles potential whitespace and colons.
+    local json=$1; local key=$2
     echo "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\(.[^\"]*\)\".*/\1/p"
 }
-
-# Checks if the "success" field in a JSON response is true.
-# Usage: is_success <json_string>
 is_success() {
-    local json=$1
-    # Grep for "success":true, ignoring whitespace.
-    echo "$json" | grep -q '"success"[[:space:]]*:[[:space:]]*true'
+    echo "$1" | grep -q '"success"[[:space:]]*:[[:space:]]*true'
 }
-
-# Parses an array of objects and returns a formatted list of two specified keys.
-# Usage: parse_json_array <json_string> <key1> <key2>
 parse_json_array() {
-    local json=$1
-    local key1=$2
-    local key2=$3
-    # Use awk to process the JSON line by line.
-    # This is a robust way to handle multi-line formatted JSON.
-    echo "$json" | tr -d '\n' | tr '{' '\n' | \
-    sed 's/\[//g; s/\]//g' | \
-    grep "\"${key1}\"" | \
+    local json=$1; local key1=$2; local key2=$3
+    echo "$json" | tr -d '\n' | tr '{' '\n' | sed 's/\[\|\]//g' | grep "\"${key1}\"" |
     awk -F'"' -v k1="$key1" -v k2="$key2" '{
         id=""; name="";
         for(i=1; i<=NF; i++) {
@@ -123,70 +102,110 @@ parse_json_array() {
 # SECTION 3: CORE INSTALLER LOGIC FUNCTIONS
 # ==============================================================================
 
-# Checks for dependencies.
+# Checks for dependencies, including the special Termux:API.
 ensure_dependencies() {
     info "Checking for required dependencies..."
     command -v curl >/dev/null || error "'curl' is not installed. Please install it first."
-    # No jq check needed anymore!
+    
+    # Check if we are in Termux before checking for termux-api
+    if [[ -n "${PREFIX-}" ]] && [[ "$PREFIX" == *"/com.termux"* ]]; then
+        if ! command -v termux-clipboard-get >/dev/null; then
+            warn "'termux-api' package is not installed. It is required for the seamless token experience."
+            read -p "Would you like to install it now? (y/N): " choice
+            if [[ "$choice" =~ ^[yY]([eE][sS])?$ ]]; then
+                pkg install -y termux-api
+                # Also check if the Termux:API app is installed
+                if ! termux-toast -h &>/dev/null; then
+                   warn "Please also install the 'Termux:API' app from F-Droid or the Play Store."
+                fi
+            else
+                error "Please install 'termux-api' (pkg install termux-api) and the Termux:API app, then run this script again."
+            fi
+        fi
+    fi
     success "All dependencies are met."
 }
 
-# Guides the user through token creation using their browser.
+# Guides the user through token creation using their browser and clipboard polling.
 prompt_and_verify_token() {
     local api_token=""
-    # This URL pre-fills the token creation form with the exact permissions needed.
-    local token_url="https://dash.cloudflare.com/profile/api-tokens/new?name=DNS-Worker-Wizard&description=API%20Token%20for%20DNS%20Worker%20Deployment&scope=com.cloudflare.api.account.zone.list&scope=com.cloudflare.api.account.user.read&scope=com.cloudflare.api.account.account.read&scope=com.cloudflare.api.account.workers.subdomain.update&scope=com.cloudflare.api.account.workers.script.update"
+    local token_url="https://dash.cloudflare.com/profile/api-tokens/new?name=DNS-Worker-Wizard-$(date +%s)&description=API%20Token%20for%20DNS%20Worker%20Deployment&scope=com.cloudflare.api.account.zone.list&scope=com.cloudflare.api.account.user.read&scope=com.cloudflare.api.account.account.read&scope=com.cloudflare.api.account.workers.subdomain.update&scope=com.cloudflare.api.account.workers.script.update"
 
     info "The script will now open a browser for you to create a secure API token."
-    warn "If the browser does not open, please manually copy the URL below."
-    echo -e "${C_YELLOW}${token_url}${C_RESET}"
-    echo
-    read -p "Press [ENTER] to continue..."
+    read -p "Press [ENTER] to open your browser..."
 
-    # Use termux-open-url if available, otherwise suggest manual opening.
     if command -v termux-open-url >/dev/null; then
         termux-open-url "$token_url"
     else
-        warn "Could not find 'termux-open-url'. Please open the link manually."
+        warn "Could not find 'termux-open-url'. Please open this link manually:"
+        echo -e "${C_YELLOW}${token_url}${C_RESET}"
     fi
 
     echo
     info "IN YOUR BROWSER:"
-    echo "1. Scroll to the bottom of the Cloudflare page."
-    echo "2. Click the 'Continue to summary' button."
-    echo "3. Click the 'Create Token' button."
-    echo "4. Click the 'Copy' button to copy your new API token."
+    echo "1. Scroll to the bottom and click 'Continue to summary'."
+    echo "2. Click 'Create Token'."
+    echo -e "3. ${C_YELLOW}Click the 'Copy' button to copy your new API token.${C_RESET}"
     echo
     
-    read -sp "Please paste the copied API token here: " api_token
-    echo
-    [[ -z "$api_token" ]] && error "API token cannot be empty."
+    # --- Clipboard Polling Magic ---
+    info "Waiting for you to copy the API token to your clipboard..."
+    local clipboard_content=""
+    local timeout=120 # 2 minutes timeout
+    local start_time=$(date +%s)
+
+    while true; do
+        if command -v termux-clipboard-get >/dev/null; then
+            clipboard_content=$(termux-clipboard-get)
+        else
+            # Fallback for non-Termux environments
+            read -sp "Please paste the copied API token here: " clipboard_content
+            break
+        fi
+
+        # A Cloudflare API token is typically a 40-char alphanumeric string
+        if [[ "${clipboard_content}" =~ ^[a-zA-Z0-9_-]{40}$ ]]; then
+            api_token="${clipboard_content}"
+            # Clear clipboard for security
+            if command -v termux-clipboard-set >/dev/null; then
+                termux-clipboard-set ""
+            fi
+            break
+        fi
+
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+        if [[ $elapsed -ge $timeout ]]; then
+            error "Timed out waiting for API token. Please run the script again."
+        fi
+        
+        # Print a waiting indicator without spamming
+        echo -n "."
+        sleep 2
+    done
+    echo # Newline after the dots
     
-    info "Verifying API token..."
+    [[ -z "$api_token" ]] && error "API token was not obtained."
+    success "API Token successfully and securely retrieved from clipboard!"
+    
+    info "Verifying the retrieved API token..."
     local verify_response
     verify_response=$(curl --connect-timeout ${CURL_TIMEOUT} -s -X GET "${CF_API_BASE_URL}/user/tokens/verify" -H "Authorization: Bearer ${api_token}")
     
     if ! is_success "$verify_response"; then
-        local error_msg
-        error_msg=$(parse_json_value "$verify_response" "message")
-        [[ -z "$error_msg" ]] && error_msg="Invalid API response"
-        error "API token is invalid. Cloudflare message: ${error_msg}"
+        error "The retrieved API token is invalid. Please try again."
     fi
     success "API token verified successfully."
     API_TOKEN="${api_token}"
 }
 
-# Selects a Cloudflare account.
+# (The rest of the functions: select_cf_account, ensure_worker_subdomain, deploy_worker remain the same as v2.0.0)
 select_cf_account() {
     info "Fetching your Cloudflare accounts..."
-    local accounts_response
+    local accounts_response accounts_list account_count
     accounts_response=$(curl --connect-timeout ${CURL_TIMEOUT} -s -X GET "${CF_API_BASE_URL}/accounts" -H "Authorization: Bearer ${API_TOKEN}")
-    
-    local accounts_list
     accounts_list=$(parse_json_array "$accounts_response" "id" "name")
     [[ -z "$accounts_list" ]] && error "No accounts found for this API token."
-
-    local account_count
     account_count=$(echo "$accounts_list" | wc -l)
     
     local account_id account_name
@@ -197,13 +216,10 @@ select_cf_account() {
     else
         info "Multiple accounts found. Please choose one:"
         echo "$accounts_list" | nl -w2 -s'. '
-        local choice
+        local choice selection
         read -p "Enter the number of the account you want to use: " choice
-        
-        local selection
         selection=$(echo "$accounts_list" | sed -n "${choice}p")
         [[ -z "$selection" ]] && error "Invalid selection."
-
         account_id=$(echo "$selection" | awk '{print $1}')
         account_name=$(echo "$selection" | awk '{$1=""; print $0}' | sed 's/^[ \t]*//')
         success "Account '${account_name}' selected."
@@ -211,7 +227,6 @@ select_cf_account() {
     ACCOUNT_ID="${account_id}"
 }
 
-# Ensures a workers.dev subdomain is available.
 ensure_worker_subdomain() {
     info "Checking for a workers.dev subdomain..."
     local subdomain_response worker_subdomain
@@ -239,7 +254,6 @@ ensure_worker_subdomain() {
     WORKER_SUBDOMAIN="${worker_subdomain}"
 }
 
-# Deploys the worker script.
 deploy_worker() {
     local worker_name=$1
     info "Downloading worker script and preparing for deployment..."
